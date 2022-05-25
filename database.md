@@ -120,6 +120,7 @@ bool EntityTableMysql::syncToDB(DBInterface* pdbi)
 带着这个疑问来看dbmgr的初始化流程就会发现:  
 - dbmgr的初始化时载入所有实体的def信息,并把每个实体初始化为EntityTableMysql类  
 
+```cpp
         bool EntityTables::load(DBInterface* pdbi)
         { // entity_table.cpp
             EntityDef::SCRIPT_MODULES smodules = EntityDef::getScriptModules();
@@ -142,10 +143,12 @@ bool EntityTableMysql::syncToDB(DBInterface* pdbi)
 
             return true;
         }
+```
 
 - 依次对每个 EntityTableMysql 调用初始化接口并将其存入将要用来建表的 map 属性 tables_ 里面
 - 在上一步对每个 EntityTableMysql 初始化时对所有 Properties 依次调用初始化,如果当前 property 是 ARRAY 类型,则将其也加入 table_ 里面,并继续递归初始化
 
+```cpp
         bool EntityTableItemMysql_ARRAY::initialize(const PropertyDescription* pPropertyDescription,
                                                     const DataType* pDataType, std::string name)
         {
@@ -156,11 +159,59 @@ bool EntityTableMysql::syncToDB(DBInterface* pdbi)
 
             ...
 
-            pTable->pEntityTables()->addTable(pTable);
+            pTable->pEntityTables()->addTable(pTable);·
             return true;
         }
+```
 
 - 根据之前初始化得到的 tables_ 来走上面的 EntityTableMysql::syncToDB 函数
 
-## 从DB中创建实体流程
+## 实体写DB流程
 
+- 实体在销毁过程开始时候回首先调用引擎的 writeToDB 接口
+
+```cpp
+    SCRIPT_METHOD_DECLARE("writeToDB",						pyWriteToDB,						METH_VARARGS,					0)
+```
+
+- 之后来到下面这个函数
+
+```cpp
+void Entity::writeToDB(void* data, void* extra1, void* extra2)
+{
+	PyObject* pyCallback = NULL;
+	int8 shouldAutoLoad = dbid() <= 0 ? 0 : -1;
+
+	// data 是有可能会NULL的， 比如定时存档是不需要回调函数的
+	if(data != NULL)
+		pyCallback = static_cast<PyObject*>(data);
+
+	if(extra1 != NULL && (*static_cast<int*>(extra1)) != -1)
+		shouldAutoLoad = (*static_cast<int*>(extra1)) > 0 ? 1 : 0;
+    
+    // ...... 省略一万字
+
+	CALLBACK_ID callbackID = 0;
+	if(pyCallback != NULL)
+	{
+		callbackID = callbackMgr().save(pyCallback);
+	}
+
+	// creatingCell_ 此时可能正在创建cell
+	// 不过我们在此假设在cell未创建完成的时候base这个接口被调用
+	// 写入数据库的是该entity的初始值， 并不影响
+	if(this->cellEntityCall() == NULL) 
+	{
+		onCellWriteToDBCompleted(callbackID, shouldAutoLoad, -1);
+	}
+	else
+	{
+		Network::Bundle* pBundle = Network::Bundle::createPoolObject(OBJECTPOOL_POINT);
+		(*pBundle).newMessage(CellappInterface::reqWriteToDBFromBaseapp);
+		(*pBundle) << this->id();
+		(*pBundle) << callbackID;
+		(*pBundle) << shouldAutoLoad;
+		sendToCellapp(pBundle);
+	}
+}
+```
