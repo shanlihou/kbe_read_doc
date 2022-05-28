@@ -190,6 +190,7 @@ void Entity::writeToDB(void* data, void* extra1, void* extra2)
 		shouldAutoLoad = (*static_cast<int*>(extra1)) > 0 ? 1 : 0;
     
     // ...... 省略一万字
+    isArchiveing_ = true; // 归档标记
 
 	CALLBACK_ID callbackID = 0;
 	if(pyCallback != NULL)
@@ -213,5 +214,173 @@ void Entity::writeToDB(void* data, void* extra1, void* extra2)
 		(*pBundle) << shouldAutoLoad;
 		sendToCellapp(pBundle);
 	}
+}
+```
+
+- 可以看到当从实体 base 身上调用 writeToDB 时候,会先走到实体的 cell 部分,下面看下 cell 代码
+
+```cpp
+void Entity::writeToDB(void* data, void* extra1, void* extra2)
+{
+	CALLBACK_ID* pCallbackID = static_cast<CALLBACK_ID*>(data);
+	CALLBACK_ID callbackID = 0;
+
+	if(pCallbackID)
+		callbackID = *pCallbackID;
+
+	int8 shouldAutoLoad = -1;
+	if (extra1)
+		shouldAutoLoad = *static_cast<int8*>(extra1);
+
+	int dbInterfaceIndex = -1;
+
+    // ...... 省略一万字
+
+	onWriteToDB(); // 这里回调到脚本层
+	backupCellData(); // 这里是吧cellData先行发回给base部分,发送协议为Baseapp::onBackupEntityCellData
+
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject(OBJECTPOOL_POINT);
+	(*pBundle).newMessage(BaseappInterface::onCellWriteToDBCompleted);
+	(*pBundle) << this->id();
+	(*pBundle) << callbackID;
+	(*pBundle) << shouldAutoLoad;
+	(*pBundle) << dbInterfaceIndex;
+
+	if(this->baseEntityCall())
+	{
+		this->baseEntityCall()->sendCall(pBundle);
+	}
+}
+```
+
+- 看到这里先将 cell 数据打包成 cellData 给 base 先发一份,然后再调用 base 的 onCellWriteToDBCompleted 接口
+
+```cpp
+void Entity::onCellWriteToDBCompleted(CALLBACK_ID callbackID, int8 shouldAutoLoad, int dbInterfaceIndex)
+{
+	SCOPED_PROFILE(SCRIPTCALL_PROFILE);
+	CALL_ENTITY_AND_COMPONENTS_METHOD(this, SCRIPT_OBJECT_CALL_ARGS0(pyTempObj, const_cast<char*>("onPreArchive"), GETERR));
+
+	if (dbInterfaceIndex >= 0)
+		dbInterfaceIndex_ = dbInterfaceIndex;
+
+	hasDB(true);
+	
+	onWriteToDB();
+
+	// 如果在数据库中已经存在该entity则允许应用层多次调用写库进行数据及时覆盖需求
+	if(this->DBID_ > 0)
+		isArchiveing_ = false;
+
+	Components::ComponentInfos* dbmgrinfos = Components::getSingleton().getCachedDbmgr(this->dbid());
+
+	if(dbmgrinfos == NULL || dbmgrinfos->pChannel == NULL || dbmgrinfos->cid == 0)
+	{
+		ERROR_MSG(fmt::format("{}::onCellWriteToDBCompleted({}): not found dbmgr!\n", 
+			this->scriptName(), this->id()));
+
+		return;
+	}
+	
+	MemoryStream* s = MemoryStream::createPoolObject(OBJECTPOOL_POINT);
+
+	try
+	{
+		addPersistentsDataToStream(ED_FLAG_ALL, s);
+	}
+	catch (MemoryStreamWriteOverflow & err)
+	{
+		ERROR_MSG(fmt::format("{}::onCellWriteToDBCompleted({}): {}\n",
+			this->scriptName(), this->id(), err.what()));
+
+		MemoryStream::reclaimPoolObject(s);
+		return;
+	}
+
+	if (s->length() == 0)
+	{
+		MemoryStream::reclaimPoolObject(s);
+		return;
+	}
+
+	KBE_SHA1 sha;
+	uint32 digest[5];
+
+	sha.Input(s->data(), s->length());
+	sha.Result(digest);
+
+	// 检查数据是否有变化，有变化则将数据备份并且记录数据hash，没变化什么也不做
+	if (memcmp((void*)&persistentDigest_[0], (void*)&digest[0], sizeof(persistentDigest_)) == 0)
+	{
+		MemoryStream::reclaimPoolObject(s);
+
+		if (callbackID > 0)
+		{
+			PyObjectPtr pyCallback = callbackMgr().take(callbackID);
+			if (pyCallback != NULL)
+			{
+				PyObject* pyargs = PyTuple_New(2);
+
+				Py_INCREF(this);
+				PyTuple_SET_ITEM(pyargs, 0, PyBool_FromLong(1));
+				PyTuple_SET_ITEM(pyargs, 1, this);
+
+				PyObject* pyRet = PyObject_CallObject(pyCallback.get(), pyargs);
+				if (pyRet == NULL)
+				{
+					SCRIPT_ERROR_CHECK();
+				}
+				else
+				{
+					Py_DECREF(pyRet);
+				}
+				Py_DECREF(pyargs);
+			}
+			else
+			{
+				ERROR_MSG(fmt::format("{}::onWriteToDBCallback: not found callback:{}.\n",
+					this->scriptName(), callbackID));
+			}			
+		}
+		return;
+	}
+	else
+	{
+		setDirty((uint32*)&digest[0]);
+	}
+
+	Network::Bundle* pBundle = Network::Bundle::createPoolObject(OBJECTPOOL_POINT);
+	(*pBundle).newMessage(DbmgrInterface::writeEntity);
+
+	(*pBundle) << g_componentID;
+	(*pBundle) << this->id();
+	(*pBundle) << this->dbid();
+	(*pBundle) << this->dbInterfaceIndex();
+	(*pBundle) << this->lastDbmgrCid();
+	(*pBundle) << this->pScriptModule()->getUType();
+	(*pBundle) << callbackID;
+	(*pBundle) << shouldAutoLoad;
+
+	// 记录登录地址
+	if(this->dbid() == 0)
+	{
+		uint32 ip = 0;
+		uint16 port = 0;
+		
+		if(this->clientEntityCall())
+		{
+			ip = this->clientEntityCall()->addr().ip;
+			port = this->clientEntityCall()->addr().port;
+		}
+
+		(*pBundle) << ip;
+		(*pBundle) << port;
+	}
+
+	(*pBundle).append(*s);
+
+	dbmgrinfos->pChannel->send(pBundle);
+	MemoryStream::reclaimPoolObject(s);
+	lastDbmgrCid(dbmgrinfos->cid);
 }
 ```
