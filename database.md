@@ -215,3 +215,296 @@ void Entity::writeToDB(void* data, void* extra1, void* extra2)
 	}
 }
 ```
+
+```cpp
+	static bool writeDB(DB_TABLE_OP optype, DBInterface* pdbi, mysql::DBContext& context, DBidCache* pDbidCache, bool hasDbidCache, bool writeCurContext = true)
+	{
+		bool ret = true;
+
+		if (!context.isEmpty && writeCurContext)
+		{
+			SqlStatement* pSqlcmd = createSql(pdbi, optype, context.tableName,
+				context.parentTableDBID,
+				context.dbid, context.items);
+
+			ret = pSqlcmd->query();  // 这边执行一次写入操作
+			context.dbid = pSqlcmd->dbid();
+			if (pDbidCache)
+			{
+				pDbidCache->setDbid(pSqlcmd->dbid());
+			}
+			delete pSqlcmd;
+		}
+
+		if (optype == TABLE_OP_INSERT)
+		{
+			// 开始更新所有的子表
+			mysql::DBContext::DB_RW_CONTEXTS::iterator iter1 = context.optable.begin();
+			for (; iter1 != context.optable.end(); ++iter1)
+			{
+				mysql::DBContext& wbox = *iter1->second.get();
+
+				// 绑定表关系
+				wbox.parentTableDBID = context.dbid;
+
+				DBidCache* pChildDbidCache = NULL;
+
+				if (pDbidCache && !wbox.isEmpty)
+				{
+					pChildDbidCache = new DBidCache(wbox.dbid, iter1->first, pDbidCache);
+					pDbidCache->addChildDbidCache(pChildDbidCache);
+				}
+
+				// 更新子表
+				writeDB(optype, pdbi, wbox, pChildDbidCache, hasDbidCache);
+			}
+		}
+		else
+		{
+			// 如果有父ID首先得到该属性数据库中同父id的数据有多少条目， 并取出每条数据的id
+			// 然后将内存中的数据顺序更新至数据库， 如果数据库中有存在的条目则顺序覆盖更新已有的条目， 如果数据数量
+			// 大于数据库中已有的条目则插入剩余的数据， 如果数据少于数据库中的条目则删除数据库中的条目
+			// select id from tbl_SpawnPoint_xxx_values where parentID = 7;
+			KBEUnordered_map< std::string, std::vector<DBID> > childTableDBIDs;
+			TABLE_DATAS_MAP  childTableDatas;
+
+			if (hasDbidCache && pDbidCache)
+				childTableDBIDs = pDbidCache->childTableDBIDs_;
+
+			if (context.dbid > 0)
+			{
+				mysql::DBContext::DB_RW_CONTEXTS::iterator iter1 = context.optable.begin();
+				for (; iter1 != context.optable.end(); ++iter1) // 遍历子表
+				{
+					mysql::DBContext& wbox = *iter1->second.get(); // 取出子表context
+
+					KBEUnordered_map<std::string, std::vector<DBID> >::iterator iter =
+						childTableDBIDs.find(context.tableName); // 查找 父表 是否有cache
+
+					if (iter == childTableDBIDs.end())
+					{
+						std::vector<DBID> v; 
+						childTableDBIDs.insert(std::pair< std::string, std::vector<DBID> >(wbox.tableName, v)); // 插入子表空 vec
+
+						TABLE_DATAS dataVec;
+						childTableDatas.insert(std::pair < std::string, TABLE_DATAS>(wbox.tableName, dataVec)); // 插入子表空 vec
+					}
+
+					childTableDatas[wbox.tableName].push_back(iter1->second);
+				}
+
+				if (hasDbidCache && pDbidCache)
+				{
+					if (g_kbeSrvConfig.isCheckDbidCache())
+					{
+						KBEUnordered_map< std::string, std::vector<DBID> >::iterator tabiter = childTableDBIDs.begin();
+						for (; tabiter != childTableDBIDs.end(); tabiter++)
+						{
+							char sqlstr[MAX_BUF * 10];
+							kbe_snprintf(sqlstr, MAX_BUF * 10, "select id from " ENTITY_TABLE_PERFIX "_%s where " TABLE_PARENTID_CONST_STR "=%" PRDBID,
+								tabiter->first.c_str(),
+								context.dbid);
+
+							if (pdbi->query(sqlstr, strlen(sqlstr), false))
+							{
+								std::vector<DBID> childDbids;
+								MYSQL_RES * pResult = mysql_store_result(static_cast<DBInterfaceMysql*>(pdbi)->mysql());
+								if (pResult)
+								{
+									MYSQL_ROW arow;
+									while ((arow = mysql_fetch_row(pResult)) != NULL)
+									{
+										DBID old_dbid;
+										StringConv::str2value(old_dbid, arow[0]);
+										childDbids.push_back(old_dbid);
+									}
+
+									mysql_free_result(pResult);
+
+									std::sort(childDbids.begin(), childDbids.end());
+									std::sort(tabiter->second.begin(), tabiter->second.end());
+									if (childDbids != tabiter->second)
+									{
+										ERROR_MSG(fmt::format("dbidCache is error {}, {}\n", tabiter->first.c_str(), context.dbid));
+										for (size_t i = 0; i < childDbids.size(); i++) {
+											int d = childDbids[i];
+											ERROR_MSG(fmt::format("childDbids {}, {}\n", tabiter->first.c_str(), d));
+										}
+										for (size_t i = 0; i < tabiter->second.size(); i++) {
+											int d = tabiter->second[i];
+											ERROR_MSG(fmt::format("tabiter->second {}, {}\n", tabiter->first.c_str(), d));
+										}// 这里纯粹检查报个错,然后把因为错了的重新赋值一下
+										tabiter->second = childDbids;
+										hasDbidCache = false;
+										DBidCache* pRootDbidCache = pDbidCache->getRootDbidCache();
+										pRootDbidCache->setIsValid(false);
+										pDbidCache = NULL;
+									}
+								}								
+							}
+						}
+					}
+				}
+				else
+				{
+					KBEUnordered_map< std::string, std::vector<DBID> >::iterator tabiter = childTableDBIDs.begin();
+					for (; tabiter != childTableDBIDs.end(); tabiter++)
+					{
+						char sqlstr[MAX_BUF * 10];
+						kbe_snprintf(sqlstr, MAX_BUF * 10, "select id from " ENTITY_TABLE_PERFIX "_%s where " TABLE_PARENTID_CONST_STR "=%" PRDBID,
+							tabiter->first.c_str(),
+							context.dbid);
+
+						if (pdbi->query(sqlstr, strlen(sqlstr), false))
+						{
+							MYSQL_RES * pResult = mysql_store_result(static_cast<DBInterfaceMysql*>(pdbi)->mysql());
+							if (pResult)
+							{
+								MYSQL_ROW arow;
+								while ((arow = mysql_fetch_row(pResult)) != NULL)
+								{
+									DBID old_dbid;
+									StringConv::str2value(old_dbid, arow[0]); 
+									if (!hasDbidCache)
+										tabiter->second.push_back(old_dbid);
+
+									if (!hasDbidCache && pDbidCache)
+									{
+										DBidCache* pChildDbidCache = new DBidCache(old_dbid, tabiter->first, pDbidCache);
+										pDbidCache->addChildDbidCache(pChildDbidCache);
+									}
+								}
+
+								mysql_free_result(pResult);
+							}
+						}
+					}
+				}
+			}
+
+			// 如果是要清空此表， 则循环N次已经找到的dbid， 使其子表中的子表也能有效删除
+			if (!context.isEmpty)
+			{
+				// 开始更新所有的子表
+				TABLE_DATAS_MAP::iterator tableIter = childTableDatas.begin();
+				for (; tableIter != childTableDatas.end(); ++tableIter)
+				{
+					TABLE_DATAS& datas = tableIter->second;
+					KBEUnordered_map<std::string, std::vector<DBID> >::iterator iter =
+						childTableDBIDs.find(tableIter->first);
+
+					if (iter != childTableDBIDs.end())
+					{
+						int nBatchlyWrite = writeDBBatchly(optype, pdbi, context, tableIter->first, datas, iter->second, pDbidCache, hasDbidCache);
+						if (nBatchlyWrite >= 0)
+						{
+							iter->second.erase(iter->second.begin(), iter->second.begin() + nBatchlyWrite);
+							for (size_t i = nBatchlyWrite;i < datas.size(); ++i)
+							{
+								mysql::DBContext& childContext = *(datas[i].get());
+								childContext.parentTableDBID = context.dbid;
+								childContext.dbid = 0;
+								DBidCache* pChildDbidCache = NULL;
+								if (pDbidCache && !childContext.isEmpty)
+								{
+									pChildDbidCache = new DBidCache(childContext.dbid, childContext.tableName, pDbidCache);
+									pDbidCache->addChildDbidCache(pChildDbidCache);
+								}
+								writeDB(optype, pdbi, childContext, pChildDbidCache, hasDbidCache);
+							}
+						}
+					}
+				}
+
+				/*mysql::DBContext::DB_RW_CONTEXTS::iterator iter1 = context.optable.begin();
+				for(; iter1 != context.optable.end(); ++iter1)
+				{
+					mysql::DBContext& wbox = *iter1->second.get();
+
+					if(wbox.isEmpty)
+						continue;
+
+					// 绑定表关系
+					wbox.parentTableDBID = context.dbid;
+
+					KBEUnordered_map<std::string, std::vector<DBID> >::iterator iter =
+						childTableDBIDs.find(wbox.tableName);
+
+					if(iter != childTableDBIDs.end())
+					{
+						if(iter->second.size() > 0)
+						{
+							wbox.dbid = iter->second.front();
+							iter->second.erase(iter->second.begin());
+						}
+
+						if(iter->second.size() <= 0)
+						{
+							childTableDBIDs.erase(wbox.tableName);
+						}
+					}
+
+					// 更新子表
+					writeDB(optype, pdbi, wbox);
+				}*/
+			}
+
+			// 删除废弃的数据项
+			KBEUnordered_map< std::string, std::vector<DBID> >::iterator tabiter = childTableDBIDs.begin();
+			for (; tabiter != childTableDBIDs.end(); ++tabiter)
+			{
+				if (tabiter->second.size() == 0)
+					continue;
+
+				// 先删除数据库中的记录
+				std::string sqlstr = "delete from " ENTITY_TABLE_PERFIX "_";
+				sqlstr += tabiter->first;
+				sqlstr += " where " TABLE_ID_CONST_STR " in (";
+
+				std::vector<DBID>::iterator iter = tabiter->second.begin();
+				for (; iter != tabiter->second.end(); ++iter)
+				{
+					DBID dbid = (*iter);
+
+					char sqlstr1[MAX_BUF];
+					kbe_snprintf(sqlstr1, MAX_BUF, "%" PRDBID, dbid);
+					sqlstr += sqlstr1;
+					sqlstr += ",";
+				}
+
+				sqlstr.erase(sqlstr.size() - 1);
+				sqlstr += ")";
+				bool ret = pdbi->query(sqlstr.c_str(), sqlstr.size(), false);
+				KBE_ASSERT(ret);
+
+				TABLE_DATAS_MAP::iterator it = childTableDatas.find(tabiter->first);
+				if (it != childTableDatas.end() && !it->second.empty())
+				{
+					mysql::DBContext& wbox = *it->second[0].get();
+					auto iter = tabiter->second.begin();
+					for (; iter != tabiter->second.end(); ++iter)
+					{
+						DBID dbid = (*iter);
+
+						wbox.parentTableDBID = context.dbid;
+						wbox.dbid = dbid;
+						wbox.isEmpty = true;
+
+						DBidCache* pChildDbidCache = NULL;
+						if (pDbidCache)
+						{
+							pChildDbidCache = pDbidCache->getChildDbidCache(tabiter->first, dbid);
+						}
+						// 删除子表
+						writeDB(optype, pdbi, wbox, pChildDbidCache, hasDbidCache);
+						if (pChildDbidCache && pDbidCache)
+						{
+							pDbidCache->delChildDbidCache(pChildDbidCache);
+						}
+					}
+				}
+			}
+		}
+		return ret;
+	}
+```
